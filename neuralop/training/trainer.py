@@ -123,11 +123,8 @@ class Trainer:
         if eval_losses is None: # By default just evaluate on the training loss
             eval_losses = dict(l2=training_loss)
 
-        if self.use_distributed:
-            is_logger = (comm.get_world_rank() == 0)
-        else:
-            is_logger = True 
-        
+        errors = None
+
         for epoch in range(self.n_epochs):
 
             if self.callbacks:
@@ -150,6 +147,9 @@ class Trainer:
 
                 if self.data_processor is not None:
                     sample = self.data_processor.preprocess(sample)
+                else:
+                    # load data to device if no preprocessor exists
+                    sample = {k:v.to(self.device) for k,v in sample.items() if torch.is_tensor(v)}
 
                 if self.amp_autocast:
                     with amp.autocast(enabled=True):
@@ -158,7 +158,7 @@ class Trainer:
                     out  = self.model(**sample)
 
                 if self.data_processor is not None:
-                    out = self.data_processor.postprocess(out)
+                    out, sample = self.data_processor.postprocess(out, sample)
 
                 if self.callbacks:
                     self.callbacks.on_before_loss(out=out)
@@ -183,8 +183,6 @@ class Trainer:
                         elif isinstance(out, dict):
                             loss += training_loss(**out, **sample)
                 
-                # del out
-
                 if regularizer:
                     loss += regularizer.loss
                 
@@ -220,13 +218,15 @@ class Trainer:
                 
 
                 for loader_name, loader in test_loaders.items():
-                    _ = self.evaluate(eval_losses, loader, log_prefix=loader_name)
+                    errors = self.evaluate(eval_losses, loader, log_prefix=loader_name)
 
                 if self.callbacks:
                     self.callbacks.on_val_end()
             
             if self.callbacks:
                 self.callbacks.on_epoch_end(epoch=epoch, train_err=train_err, avg_loss=avg_loss)
+
+        return errors
 
     def evaluate(self, loss_dict, data_loader,
                  log_prefix=''):
@@ -264,11 +264,14 @@ class Trainer:
 
                 if self.data_processor is not None:
                     sample = self.data_processor.preprocess(sample)
-
+                else:
+                    # load data to device if no preprocessor exists
+                    sample = {k:v.to(self.device) for k,v in sample.items() if torch.is_tensor(v)}
+                    
                 out = self.model(**sample)
 
                 if self.data_processor is not None:
-                    out = self.data_processor.postprocess(out)
+                    out, sample = self.data_processor.postprocess(out, sample)
 
                 if self.callbacks:
                     self.callbacks.on_before_val_loss(out=out)

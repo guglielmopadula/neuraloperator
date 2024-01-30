@@ -1,4 +1,5 @@
 from ..utils import count_tensor_params
+from .transforms import Transform
 from abc import abstractmethod
 from collections.abc import Iterable
 import torch
@@ -102,35 +103,7 @@ class MultipleFieldOutputEncoder(OutputEncoder):
         self.encoders = {k:v.to(device) for k,v in self.encoders.items()}
 
 
-class TransformCallback(torch.nn.Module):
-    """OutputEncoder: converts the output of a model
-        into a form usable by some cost function.
-    """
-    def __init__(self):
-        super().__init__()
-    
-    @abstractmethod
-    def transform(self):
-        pass
-
-    @abstractmethod
-    def inverse_transform(self):
-        pass
-
-    @abstractmethod
-    def cuda(self):
-        pass
-
-    @abstractmethod
-    def cpu(self):
-        pass
-
-    @abstractmethod
-    def to(self, device):
-        pass
-
-
-class DictTransformCallback(OutputEncoder):
+class DictTransform(Transform):
     """When a model has multiple input and output fields, 
         apply a different transform to each field, 
         tries to apply the inverse_transform to each output
@@ -165,10 +138,10 @@ class DictTransformCallback(OutputEncoder):
         tensor_dict : Torch.tensor dict
             model output, indexed according to self.mappings
         """
-        out = torch.zeros_like(x)
+        out = torch.zeros_like(tensor_dict)
         
         for field,indices in self.input_mappings.items():
-            encoded = self.transforms[field].transform(x[indices])
+            encoded = self.transforms[field].transform(tensor_dict[indices])
             if self.return_mappings:
                 encoded = encoded[self.return_mappings[field]]
             out[indices] = encoded
@@ -202,11 +175,11 @@ class DictTransformCallback(OutputEncoder):
         self.encoders = {k:v.to(device) for k,v in self.encoders.items()}
 
 
-class UnitGaussianNormalizer(torch.nn.Module):
+class UnitGaussianNormalizer(Transform):
     """
     UnitGaussianNormalizer normalizes data to be zero mean and unit std. 
     """
-    def __init__(self, mean=None, std=None, eps=1e-7, dim=None):
+    def __init__(self, mean=None, std=None, eps=1e-7, dim=None, mask=None):
         """
         mean : torch.tensor or None
             has to include batch-size as a dim of 1
@@ -217,13 +190,17 @@ class UnitGaussianNormalizer(torch.nn.Module):
             for safe division by the std
         dim : int list, default is None
             if not None, dimensions of the data to reduce over to compute the mean and std.
-
+            
             .. important:: 
 
                 Has to include the batch-size (typically 0).
                 For instance, to normalize data of shape ``(batch_size, channels, height, width)``
                 along batch-size, height and width, pass ``dim=[0, 2, 3]``
         
+        mask : torch.Tensor or None, default is None
+            If not None, a tensor with the same size as a sample, 
+            with value 0 where the data should be ignored and 1 everywhere else
+
         Notes
         -----
         The resulting mean will have the same size as the input MINUS the specified dims.
@@ -237,6 +214,8 @@ class UnitGaussianNormalizer(torch.nn.Module):
 
         self.register_buffer('mean', mean)
         self.register_buffer('std', std)
+        self.register_buffer('mask', mask)
+
         self.eps = eps
         if mean is not None:
             self.ndim = mean.ndim
@@ -266,18 +245,37 @@ class UnitGaussianNormalizer(torch.nn.Module):
 
     def update_mean_std(self, data_batch):
         self.ndim = data_batch.ndim  # Note this includes batch-size
-        self.n_elements = count_tensor_params(data_batch, self.dim)
-        self.mean = torch.mean(data_batch, dim=self.dim, keepdim=True)
-        self.squared_mean = torch.mean(data_batch**2, dim=self.dim, keepdim=True)
-        self.std = torch.sqrt(self.squared_mean - self.mean**2)
+        if self.mask is None:
+            self.n_elements = count_tensor_params(data_batch, self.dim)
+            self.mean = torch.mean(data_batch, dim=self.dim, keepdim=True)
+            self.squared_mean = torch.mean(data_batch**2, dim=self.dim, keepdim=True)
+            self.std = torch.sqrt(self.squared_mean - self.mean**2)
+        else:
+            batch_size = data_batch.shape[0]
+            dim = [i - 1 for i in self.dim if i]
+            shape = [s for i, s in enumerate(self.mask.shape) if i not in dim]
+            self.n_elements = torch.count_nonzero(self.mask, dim=dim)*batch_size
+            self.mean = torch.zeros(shape)
+            self.std = torch.zeros(shape)
+            self.squared_mean = torch.zeros(shape)
+            data_batch[:, self.mask==1] = 0
+            self.mean[self.mask == 1] = torch.sum(data_batch, dim=dim, keepdim=True) / self.n_elements
+            self.squared_mean = torch.sum(data_batch**2, dim=dim, keepdim=True) / self.n_elements
+            self.std = torch.sqrt(self.squared_mean - self.mean**2)
 
     def incremental_update_mean_std(self, data_batch):
-        n_elements = count_tensor_params(data_batch, self.dim)
+        if self.mask is None:
+            n_elements = count_tensor_params(data_batch, self.dim)
+            dim = self.dim
+        else:
+            dim = [i - 1 for i in self.dim if i]
+            n_elements = torch.count_nonzero(self.mask, dim=dim)*data_batch.shape[0]
+            data_batch[:, self.mask == 1] = 0
 
         self.mean = (1.0/(self.n_elements + n_elements))*(
-            self.n_elements*self.mean + torch.sum(data_batch, dim=self.dim, keepdim=True))
+            self.n_elements*self.mean + torch.sum(data_batch, dim=dim, keepdim=True))
         self.squared_mean = (1.0/(self.n_elements + n_elements - 1))*(
-            self.n_elements*self.squared_mean + torch.sum(data_batch**2, dim=self.dim, keepdim=True))
+            self.n_elements*self.squared_mean + torch.sum(data_batch**2, dim=dim, keepdim=True))
         self.n_elements += n_elements
 
         self.std = torch.sqrt(self.squared_mean - self.mean**2)
@@ -307,7 +305,7 @@ class UnitGaussianNormalizer(torch.nn.Module):
         return self
     
     @classmethod
-    def from_dataset(cls, dataset, dim=None, keys=None):
+    def from_dataset(cls, dataset, dim=None, keys=None, mask=None):
         """Return a dictionary of normalizer instances, fitted on the given dataset
         
         Parameters
@@ -325,7 +323,7 @@ class UnitGaussianNormalizer(torch.nn.Module):
             if not i:
                 if not keys:
                     keys = data_dict.keys()
-                instances = {key: cls(dim=dim) for key in keys}
+                instances = {key: cls(dim=dim, mask=mask) for key in keys}
             for key, sample in data_dict.items():
                 instances[key].partial_fit(sample.unsqueeze(0))
         return instances
